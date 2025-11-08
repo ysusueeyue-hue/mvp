@@ -1941,6 +1941,14 @@ async def admin_stop_user_processes(query, context, user_id):
     await query.answer(f"✅ Stopped {stopped_count}/{total_count} processes for user {user_id}!", show_alert=True)
     await show_all_processes(query, context)
 
+# ADD MISSING FUNCTIONS
+async def share_referral_callback(query, context):
+    """Handle share referral callback"""
+    user_id = query.from_user.id
+    referral_link = f"https://t.me/{(await context.bot.get_me()).username}?start={user_id}"
+    
+    await query.answer(f"Referral link copied: {referral_link}", show_alert=True)
+
 def main():
     # Create necessary directories
     os.makedirs("hosted_files", exist_ok=True)
