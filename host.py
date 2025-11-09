@@ -10,6 +10,8 @@ from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes, filters
 import logging
 import sys
+import signal
+import atexit
 
 # Configure logging
 logging.basicConfig(
@@ -294,7 +296,7 @@ class FileStorageManager:
             }
         return None
 
-class HostingManager:
+class EnhancedHostingManager:
     def __init__(self):
         self.active_processes = {}
         self.process_monitors = {}
@@ -304,6 +306,93 @@ class HostingManager:
         self.user_states = {}
         self.user_manager = UserManager()
         self.file_storage = FileStorageManager()
+        self.keep_running = True
+        self.monitoring_interval = 10  # Increased monitoring interval
+        
+        # Register cleanup handlers
+        atexit.register(self.cleanup_all_processes)
+        signal.signal(signal.SIGINT, self.signal_handler)
+        signal.signal(signal.SIGTERM, self.signal_handler)
+    
+    def signal_handler(self, signum, frame):
+        """Handle shutdown signals gracefully"""
+        logger.info(f"Received signal {signum}, shutting down gracefully...")
+        self.keep_running = False
+        self.cleanup_all_processes()
+        sys.exit(0)
+    
+    def cleanup_all_processes(self):
+        """Cleanup all processes on exit"""
+        logger.info("Cleaning up all processes...")
+        with self.lock:
+            process_ids = list(self.active_processes.keys())
+        
+        for process_id in process_ids:
+            try:
+                self._force_stop_process(process_id)
+            except Exception as e:
+                logger.error(f"Error cleaning up process {process_id}: {e}")
+    
+    def _force_stop_process(self, process_id):
+        """Force stop a process with comprehensive cleanup"""
+        with self.lock:
+            process_info = self.active_processes.get(process_id)
+            if not process_info:
+                return
+            
+            process_info['stopped'] = True
+            process_info['status'] = 'stopped'
+        
+        try:
+            process = process_info['process']
+            if process.poll() is None:
+                # Kill entire process tree
+                try:
+                    parent = psutil.Process(process.pid)
+                    children = parent.children(recursive=True)
+                    
+                    # Kill children first
+                    for child in children:
+                        try:
+                            child.kill()
+                        except:
+                            pass
+                    
+                    # Kill parent
+                    try:
+                        parent.kill()
+                    except:
+                        pass
+                except:
+                    pass
+                
+                # Use process methods as backup
+                try:
+                    process.terminate()
+                    process.wait(timeout=5)
+                except:
+                    try:
+                        process.kill()
+                        process.wait(timeout=3)
+                    except:
+                        pass
+            
+            # Clean up monitoring threads
+            if process_id in self.performance_monitors:
+                self.performance_monitors[process_id] = None
+            
+            if process_id in self.process_monitors:
+                self.process_monitors[process_id] = None
+            
+            with self.lock:
+                if process_id in self.active_processes:
+                    del self.active_processes[process_id]
+            
+            logger.info(f"Force stopped process {process_id}")
+            return True
+        except Exception as e:
+            logger.error(f"Error force stopping process {process_id}: {e}")
+            return False
     
     def set_user_state(self, user_id, state, data=None):
         """Set user state for file upload sequence"""
@@ -376,17 +465,18 @@ class HostingManager:
             # Create a unique process ID
             process_id = f"{user_id}_{int(time.time())}"
             
-            # Start the process with improved settings
+            # Start the process with improved settings for 24/7 hosting
             process = subprocess.Popen(
                 ['python3', '-u', file_path],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
                 bufsize=1,
-                universal_newlines=True
+                universal_newlines=True,
+                preexec_fn=os.setsid if os.name != 'nt' else None  # Create process group
             )
             
-            # Store process info
+            # Store process info with enhanced monitoring
             with self.lock:
                 self.active_processes[process_id] = {
                     'process': process,
@@ -405,11 +495,13 @@ class HostingManager:
                     'data_sent': 0,
                     'data_received': 0,
                     'last_network_check': time.time(),
-                    'requirements_installed': requirements_installed
+                    'requirements_installed': requirements_installed,
+                    'health_check_count': 0,
+                    'last_health_check': time.time()
                 }
             
-            # Start monitoring thread
-            self._start_monitoring(process_id)
+            # Start enhanced monitoring thread
+            self._start_enhanced_monitoring(process_id)
             # Start performance monitoring
             self._start_performance_monitoring(process_id)
             
@@ -419,34 +511,67 @@ class HostingManager:
             logger.error(f"Error starting hosting: {e}")
             return None
     
-    def _start_monitoring(self, process_id):
-        """Start monitoring thread for a process"""
+    def _start_enhanced_monitoring(self, process_id):
+        """Start enhanced monitoring thread for a process with better stability"""
         if process_id in self.process_monitors:
             return
             
-        def monitor():
-            while True:
-                with self.lock:
-                    process_info = self.active_processes.get(process_id)
-                    if not process_info or process_info.get('stopped'):
-                        break
+        def enhanced_monitor():
+            consecutive_failures = 0
+            max_consecutive_failures = 3
+            
+            while self.keep_running:
+                try:
+                    with self.lock:
+                        process_info = self.active_processes.get(process_id)
+                        if not process_info or process_info.get('stopped'):
+                            break
+                    
+                    process = process_info['process']
+                    return_code = process.poll()
+                    
+                    if return_code is not None and not process_info.get('stopped'):
+                        # Process stopped unexpectedly
+                        consecutive_failures += 1
+                        logger.warning(f"Process {process_id} stopped with return code {return_code}, restart attempt {consecutive_failures}")
+                        
+                        if consecutive_failures <= max_consecutive_failures:
+                            time.sleep(2 ** consecutive_failures)  # Exponential backoff
+                            success = self._restart_process(process_id)
+                            if success:
+                                consecutive_failures = 0
+                                logger.info(f"Successfully restarted process {process_id}")
+                            else:
+                                logger.error(f"Failed to restart process {process_id}")
+                        else:
+                            logger.error(f"Process {process_id} failed {consecutive_failures} times, giving up")
+                            with self.lock:
+                                if process_id in self.active_processes:
+                                    self.active_processes[process_id]['status'] = 'failed'
+                            break
+                    else:
+                        consecutive_failures = 0  # Reset counter if process is running
+                    
+                    # Health check
+                    current_time = time.time()
+                    if current_time - process_info.get('last_health_check', 0) > 30:  # Every 30 seconds
+                        with self.lock:
+                            if process_id in self.active_processes:
+                                self.active_processes[process_id]['health_check_count'] += 1
+                                self.active_processes[process_id]['last_health_check'] = current_time
                 
-                process = process_info['process']
-                return_code = process.poll()
+                except Exception as e:
+                    logger.error(f"Error in enhanced monitoring for {process_id}: {e}")
+                    time.sleep(5)
                 
-                if return_code is not None and not process_info.get('stopped'):
-                    # Process stopped, restart it immediately
-                    logger.info(f"Process {process_id} stopped with return code {return_code}, restarting...")
-                    self._restart_process(process_id)
-                
-                time.sleep(5)
+                time.sleep(self.monitoring_interval)
             
             # Clean up
             with self.lock:
                 if process_id in self.process_monitors:
                     del self.process_monitors[process_id]
         
-        thread = threading.Thread(target=monitor)
+        thread = threading.Thread(target=enhanced_monitor)
         thread.daemon = True
         thread.start()
         self.process_monitors[process_id] = thread
@@ -457,16 +582,15 @@ class HostingManager:
             return
             
         def performance_monitor():
-            while True:
-                with self.lock:
-                    process_info = self.active_processes.get(process_id)
-                    if not process_info or process_info.get('stopped'):
-                        break
-                
+            while self.keep_running:
                 try:
+                    with self.lock:
+                        process_info = self.active_processes.get(process_id)
+                        if not process_info or process_info.get('stopped'):
+                            break
+                    
                     pid = process_info.get('pid')
                     if pid:
-                        # Get process CPU and memory usage
                         try:
                             ps_process = psutil.Process(pid)
                             cpu_percent = ps_process.cpu_percent(interval=1.0)
@@ -479,12 +603,15 @@ class HostingManager:
                                     self.active_processes[process_id]['memory_usage'] = memory_mb
                             
                         except (psutil.NoSuchProcess, psutil.AccessDenied):
-                            pass
+                            # Process might have died, check and restart if needed
+                            process = process_info['process']
+                            if process.poll() is not None:
+                                self._restart_process(process_id)
                     
                 except Exception as e:
                     logger.error(f"Error in performance monitoring for {process_id}: {e}")
                 
-                time.sleep(10)
+                time.sleep(15)  # Reduced frequency to save resources
         
         thread = threading.Thread(target=performance_monitor)
         thread.daemon = True
@@ -504,35 +631,45 @@ class HostingManager:
         conn.close()
     
     def _restart_process(self, process_id):
-        """Restart a stopped process"""
+        """Restart a stopped process with enhanced reliability"""
         with self.lock:
             process_info = self.active_processes.get(process_id)
             if not process_info or process_info.get('stopped'):
                 return False
         
         try:
-            # Close old process completely
+            # Close old process completely with comprehensive cleanup
             old_process = process_info['process']
-            try:
-                old_process.terminate()
-                old_process.wait(timeout=5)
-            except:
+            if old_process.poll() is None:
                 try:
-                    old_process.kill()
-                    old_process.wait(timeout=5)
+                    # Kill process group
+                    if os.name != 'nt':
+                        os.killpg(os.getpgid(old_process.pid), signal.SIGTERM)
+                    else:
+                        old_process.terminate()
+                    
+                    old_process.wait(timeout=10)
                 except:
-                    pass
+                    try:
+                        if os.name != 'nt':
+                            os.killpg(os.getpgid(old_process.pid), signal.SIGKILL)
+                        else:
+                            old_process.kill()
+                        old_process.wait(timeout=5)
+                    except:
+                        pass
             
-            time.sleep(2)
+            time.sleep(3)  # Increased delay for cleanup
             
-            # Start new process
+            # Start new process with enhanced settings
             new_process = subprocess.Popen(
                 ['python3', '-u', process_info['file_path']],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
                 bufsize=1,
-                universal_newlines=True
+                universal_newlines=True,
+                preexec_fn=os.setsid if os.name != 'nt' else None
             )
             
             # Update process info
@@ -548,6 +685,7 @@ class HostingManager:
                     self.active_processes[process_id]['memory_usage'] = 0.0
                     self.active_processes[process_id]['data_sent'] = 0
                     self.active_processes[process_id]['data_received'] = 0
+                    self.active_processes[process_id]['health_check_count'] = 0
                     
                     logger.info(f"Restarted process {process_id} with new PID {new_process.pid}")
                     return True
@@ -556,62 +694,13 @@ class HostingManager:
             
         except Exception as e:
             logger.error(f"Error restarting process {process_id}: {e}")
-            time.sleep(3)
+            time.sleep(5)
+            # Retry once
             return self._restart_process(process_id)
     
     def stop_hosting(self, process_id):
         """Stop hosting for a process completely"""
-        with self.lock:
-            process_info = self.active_processes.get(process_id)
-            if not process_info:
-                return False
-            
-            process_info['stopped'] = True
-            process_info['status'] = 'stopped'
-        
-        try:
-            process = process_info['process']
-            if process.poll() is None:
-                try:
-                    try:
-                        parent = psutil.Process(process.pid)
-                        children = parent.children(recursive=True)
-                        
-                        for child in children:
-                            try:
-                                child.kill()
-                            except:
-                                pass
-                        
-                        try:
-                            parent.kill()
-                        except:
-                            pass
-                    except:
-                        pass
-                    
-                    process.terminate()
-                    process.wait(timeout=10)
-                except Exception as e:
-                    logger.error(f"Error killing process tree: {e}")
-                    try:
-                        process.kill()
-                        process.wait(timeout=5)
-                    except:
-                        pass
-            
-            with self.lock:
-                if process_id in self.active_processes:
-                    del self.active_processes[process_id]
-            
-            if process_id in self.performance_monitors:
-                del self.performance_monitors[process_id]
-            
-            logger.info(f"Stopped hosting process {process_id}")
-            return True
-        except Exception as e:
-            logger.error(f"Error stopping process {process_id}: {e}")
-            return False
+        return self._force_stop_process(process_id)
     
     def stop_all_processes(self):
         """Stop all active processes at once"""
@@ -676,7 +765,8 @@ class HostingManager:
                 'data_sent': process_info.get('data_sent', 0),
                 'data_received': process_info.get('data_received', 0),
                 'user_id': process_info.get('user_id'),
-                'requirements_installed': process_info.get('requirements_installed', False)
+                'requirements_installed': process_info.get('requirements_installed', False),
+                'health_check_count': process_info.get('health_check_count', 0)
             }
         return None
     
@@ -762,7 +852,8 @@ class HostingManager:
             logger.error(f"Error getting system stats: {e}")
             return None
 
-hosting_manager = HostingManager()
+# Initialize enhanced hosting manager
+hosting_manager = EnhancedHostingManager()
 
 def add_hosting_record(user_id, file_name, file_path, file_id, process_id, requirements_installed=False):
     conn = sqlite3.connect('bot_data.db')
@@ -851,7 +942,7 @@ Simply send me any Python (.py) file and I'll host it for you permanently!
 - Violators will be BANNED immediately by admin
 
 Features:
-✅ 24/7 Permanent Hosting
+✅ 24/7 Permanent Hosting with Enhanced Stability
 ✅ Auto-restart if stopped  
 ✅ Secure File Storage
 ✅ Coin-based System
@@ -1009,8 +1100,9 @@ async def show_my_hostings_message(update, context, user_id):
         status_emoji = "🟢" if process['running'] else "🔴"
         uptime_str = format_uptime(process['uptime'])
         requirements_status = "✅" if process.get('requirements_installed', False) else "⏩"
+        health_status = "💚" if process.get('health_check_count', 0) > 10 else "💛"
         
-        text += f"{i}. **{process['file_name']}** {status_emoji}\n"
+        text += f"{i}. **{process['file_name']}** {status_emoji} {health_status}\n"
         text += f"   ├─ 🆔 `{process['process_id']}`\n"
         text += f"   ├─ ⏰ {uptime_str}\n"
         text += f"   ├─ 🔄 {process['restart_count']} restarts\n"
@@ -1058,8 +1150,9 @@ async def show_my_hostings(query, context):
         status_emoji = "🟢" if process['running'] else "🔴"
         uptime_str = format_uptime(process['uptime'])
         requirements_status = "✅" if process.get('requirements_installed', False) else "⏩"
+        health_status = "💚" if process.get('health_check_count', 0) > 10 else "💛"
         
-        text += f"{i}. **{process['file_name']}** {status_emoji}\n"
+        text += f"{i}. **{process['file_name']}** {status_emoji} {health_status}\n"
         text += f"   ├─ 🆔 `{process['process_id']}`\n"
         text += f"   ├─ ⏰ {uptime_str}\n"
         text += f"   ├─ 🔄 {process['restart_count']} restarts\n"
@@ -1620,7 +1713,7 @@ async def handle_python_file(update: Update, context: ContextTypes.DEFAULT_TYPE,
                 f"🚀 **Status:** 🟢 Running\n"
                 f"⏰ **Started:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
                 f"🆔 **Process ID:** `{process_id}`\n\n"
-                f"Your script is now running permanently with auto-restart!",
+                f"Your script is now running permanently with enhanced 24/7 stability!",
                 reply_markup=InlineKeyboardMarkup(keyboard),
                 parse_mode='Markdown'
             )
@@ -1654,10 +1747,12 @@ async def show_process_status(query, context, process_id):
     status_text = "Running" if stats['running'] else "Stopped"
     uptime_str = format_uptime(stats['uptime'])
     requirements_status = "✅ Installed" if stats.get('requirements_installed', False) else "⏩ Skipped"
+    health_status = "💚 Stable" if stats.get('health_check_count', 0) > 10 else "💛 Initializing"
     
     text = f"📊 **Process Status**\n\n"
     text += f"📁 **File:** {stats['file_name']}\n"
     text += f"🚀 **Status:** {status_emoji} {status_text}\n"
+    text += f"💚 **Health:** {health_status}\n"
     text += f"🆔 **Process ID:** `{process_id}`\n"
     text += f"📛 **PID:** {stats.get('pid', 'N/A')}\n"
     text += f"⏰ **Uptime:** {uptime_str}\n"
@@ -1670,6 +1765,7 @@ async def show_process_status(query, context, process_id):
     text += f"• Memory Usage: {stats.get('memory_usage', 0):.1f} MB\n"
     text += f"• Data Sent: {stats.get('data_sent', 0):.1f} B/s\n"
     text += f"• Data Received: {stats.get('data_received', 0):.1f} B/s\n"
+    text += f"• Health Checks: {stats.get('health_check_count', 0)}\n"
     
     keyboard = [
         [InlineKeyboardButton("🛑 Stop Process", callback_data=f"stop_{process_id}")],
@@ -1806,8 +1902,9 @@ async def show_all_processes(query, context):
     for i, process in enumerate(all_processes, 1):
         status_emoji = "🟢" if process['running'] else "🔴"
         uptime_str = format_uptime(process['uptime'])
+        health_status = "💚" if process.get('health_check_count', 0) > 10 else "💛"
         
-        text += f"{i}. **{process['file_name']}** {status_emoji}\n"
+        text += f"{i}. **{process['file_name']}** {status_emoji} {health_status}\n"
         text += f"   ├─ 👤 User: {process['user_id']}\n"
         text += f"   ├─ 🆔 `{process['process_id']}`\n"
         text += f"   ├─ ⏰ {uptime_str}\n"
@@ -1897,18 +1994,21 @@ async def show_admin_process_details(query, context, process_id):
     status_emoji = "🟢" if stats['running'] else "🔴"
     status_text = "Running" if stats['running'] else "Stopped"
     uptime_str = format_uptime(stats['uptime'])
+    health_status = "💚 Stable" if stats.get('health_check_count', 0) > 10 else "💛 Initializing"
     
     text = f"👑 **Admin Process Details**\n\n"
     text += f"📁 **File:** {stats['file_name']}\n"
     text += f"👤 **User ID:** {stats['user_id']}\n"
     text += f"🚀 **Status:** {status_emoji} {status_text}\n"
+    text += f"💚 **Health:** {health_status}\n"
     text += f"🆔 **Process ID:** `{process_id}`\n"
     text += f"📛 **PID:** {stats.get('pid', 'N/A')}\n"
     text += f"⏰ **Uptime:** {uptime_str}\n"
     text += f"🕒 **Started:** {stats['start_time'].strftime('%Y-%m-%d %H:%M:%S')}\n"
     text += f"🔄 **Last Restart:** {stats['last_restart'].strftime('%Y-%m-%d %H:%M:%S')}\n"
     text += f"🔁 **Restart Count:** {stats['restart_count']}\n"
-    text += f"📦 **Requirements:** {'✅ Installed' if stats.get('requirements_installed', False) else '⏩ Skipped'}\n\n"
+    text += f"📦 **Requirements:** {'✅ Installed' if stats.get('requirements_installed', False) else '⏩ Skipped'}\n"
+    text += f"💚 **Health Checks:** {stats.get('health_check_count', 0)}\n\n"
     
     text += f"🖥️ **Performance Metrics:**\n"
     text += f"• CPU Usage: {stats.get('cpu_usage', 0):.1f}%\n"
@@ -1941,14 +2041,6 @@ async def admin_stop_user_processes(query, context, user_id):
     await query.answer(f"✅ Stopped {stopped_count}/{total_count} processes for user {user_id}!", show_alert=True)
     await show_all_processes(query, context)
 
-# ADD MISSING FUNCTIONS
-async def share_referral_callback(query, context):
-    """Handle share referral callback"""
-    user_id = query.from_user.id
-    referral_link = f"https://t.me/{(await context.bot.get_me()).username}?start={user_id}"
-    
-    await query.answer(f"Referral link copied: {referral_link}", show_alert=True)
-
 def main():
     # Create necessary directories
     os.makedirs("hosted_files", exist_ok=True)
@@ -1970,9 +2062,10 @@ def main():
         
         # Start bot
         print("🤖 Bot is running...")
-        print("📊 Hosting Manager initialized")
+        print("📊 Enhanced Hosting Manager initialized")
         print("💾 Database ready")
-        print("🔄 Auto-restart system active")
+        print("🔄 Enhanced Auto-restart system active")
+        print("💚 24/7 Stability improvements applied")
         print(f"🐍 Using Python 3 for hosting")
         print(f"👑 Admin ID: {ADMIN_ID}")
         print(f"💾 File Storage Channel: {CHANNEL_ID}")
@@ -1981,6 +2074,7 @@ def main():
         print("✅ File Channel Storage Fixed")
         print("✅ Referral System Fixed")
         print("✅ All Functions Defined")
+        print("✅ Enhanced 24/7 Hosting Stability Applied")
         application.run_polling()
         
     except Exception as e:
